@@ -1,4 +1,4 @@
-import sys
+import sys, os
 from collections import defaultdict
 import pandas as pd
 import numpy as np
@@ -15,6 +15,12 @@ from torch.utils import data
 from sklearn.preprocessing import OneHotEncoder
 from torch.utils.data import SequentialSampler
 import copy
+from prettytable import PrettyTable
+from torch.utils.tensorboard import SummaryWriter
+from time import time
+from sklearn.metrics import mean_squared_error, roc_auc_score, average_precision_score, f1_score, log_loss
+import matplotlib.pyplot as plt
+import pickle
 
 ELEM_LIST = ['C', 'N', 'O', 'S', 'F', 'Si', 'P', 'Cl', 'Br', 'Mg', 'Na', 'Ca', 'Fe', 'Al', 'I', 'B', 'K', 'Se', 'Zn', 'H', 'Cu', 'Mn', 'unknown']
 ATOM_FDIM = len(ELEM_LIST) + 6 + 5 + 4 + 1
@@ -24,6 +30,7 @@ MAX_ATOM = 400
 MAX_BOND = MAX_ATOM * 2
 amino_char = ['?', 'A', 'C', 'B', 'E', 'D', 'G', 'F', 'I', 'H', 'K', 'M', 'L', 'O', 'N', 'Q', 'P', 'S', 'R', 'U', 'T', 'W', 'V', 'Y', 'X', 'Z']
 MAX_SEQ_PROTEIN = 1000
+enc_protein = OneHotEncoder().fit(np.array(amino_char).reshape(-1, 1))
 
 def get_mol(smiles):
     mol = Chem.MolFromSmiles(smiles)
@@ -222,15 +229,15 @@ def get_train_test(fold_1):
     train = pd.DataFrame(fold_1[0])
     train.rename(columns={0:'ICV',
                         1: 'Target',
-                        2: 'drug_encoding'
-                        3: 'target_encoding'
+                        2: 'drug_encoding',
+                        3: 'target_encoding',
                         4: 'label'}, 
                         inplace=True)
     test = pd.DataFrame(fold_1[1])
     test.rename(columns={0:'ICV',
                         1: 'Target',
-                        2: 'drug_encoding'
-                        3: 'target_encoding'
+                        2: 'drug_encoding',
+                        3: 'target_encoding',
                         4: 'label'}, 
                         inplace=True)
     return train, test
@@ -260,8 +267,6 @@ def generate_config(result_folder = "./result/",
                     'train_epoch': train_epoch,
                     'test_every_X_epoch': test_every_X_epoch, 
                     'LR': LR,
-                    'drug_encoding': drug_encoding,
-                    'target_encoding': target_encoding, 
                     'result_folder': result_folder,
                     'binary': False,
                     'num_workers': num_workers
@@ -276,6 +281,19 @@ def generate_config(result_folder = "./result/",
     base_config['cnn_target_kernels'] = cnn_target_kernels
     return base_config
 
+def create_var(tensor, requires_grad=None):
+    if requires_grad is None:
+        return Variable(tensor)
+    else:
+        return Variable(tensor, requires_grad=requires_grad)
+
+def index_select_ND(source, dim, index):
+    index_size = index.size()
+    suffix_dim = source.size()[1:]
+    final_size = index_size + suffix_dim
+    target = source.index_select(dim, index.view(-1))
+    return target.view(final_size)
+
 class MPNN(nn.Sequential):
 
     def __init__(self, mpnn_hidden_size, mpnn_depth):
@@ -289,6 +307,7 @@ class MPNN(nn.Sequential):
         self.W_o = nn.Linear(ATOM_FDIM + self.mpnn_hidden_size, self.mpnn_hidden_size)
 
     def forward(self, feature):
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         '''
             fatoms: (x, 39)
             fbonds: (y, 50)
@@ -349,6 +368,7 @@ class MPNN(nn.Sequential):
 class CNN(nn.Sequential):
     def __init__(self, encoding, **config):
         super(CNN, self).__init__()
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         if encoding == 'drug':
             in_ch = [63] + config['cnn_drug_filters']
             kernels = config['cnn_drug_kernels']
@@ -368,26 +388,32 @@ class CNN(nn.Sequential):
             self.conv = nn.ModuleList([nn.Conv1d(in_channels = in_ch[i], 
                                                     out_channels = in_ch[i+1], 
                                                     kernel_size = kernels[i]) for i in range(layer_size)])
-            self.conv = self.conv.double()
+            self.conv = self.conv.double().to(device)
             n_size_p = self._get_conv_output((26, 1000))
 
             self.fc1 = nn.Linear(n_size_p, config['hidden_dim_protein'])
 
     def _get_conv_output(self, shape):
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         bs = 1
         input = Variable(torch.rand(bs, *shape))
-        output_feat = self._forward_features(input.double())
+        output_feat = self._forward_features(input.double().to(device))
         n_size = output_feat.data.view(bs, -1).size(1)
         return n_size
 
     def _forward_features(self, x):
+        #device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        #x = v.float().to(device)
+        #device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        #x = x.float().to(device)
         for l in self.conv:
             x = F.relu(l(x))
         x = F.adaptive_max_pool1d(x, output_size=1)
         return x
 
     def forward(self, v):
-        v = self._forward_features(v.double())
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        v = self._forward_features(v.double().to(device))
         v = v.view(v.size(0), -1)
         v = self.fc1(v.float())
         return v
@@ -442,9 +468,30 @@ class data_process_loader(data.Dataset):
         'Generates one sample of data'
         index = self.list_IDs[index]
         v_d = self.df.iloc[index]['drug_encoding']        
+        v_p = self.df.iloc[index]['target_encoding']
         v_p = protein_2_embed(v_p)
         y = self.labels[index]
         return v_d, v_p, y
+
+def mpnn_feature_collate_func(x):
+    N_atoms_scope = torch.cat([i[4] for i in x], 0)
+    f_a = torch.cat([x[j][0].unsqueeze(0) for j in range(len(x))], 0)
+    f_b = torch.cat([x[j][1].unsqueeze(0) for j in range(len(x))], 0)
+    agraph_lst, bgraph_lst = [], []
+    for j in range(len(x)):
+        agraph_lst.append(x[j][2].unsqueeze(0))
+        bgraph_lst.append(x[j][3].unsqueeze(0))
+    agraph = torch.cat(agraph_lst, 0)
+    bgraph = torch.cat(bgraph_lst, 0)
+    return [f_a, f_b, agraph, bgraph, N_atoms_scope]
+
+def mpnn_collate_func(x):
+    mpnn_feature = [i[0] for i in x]
+    mpnn_feature = mpnn_feature_collate_func(mpnn_feature)
+    from torch.utils.data.dataloader import default_collate
+    x_remain = [list(i[1:]) for i in x]
+    x_remain_collated = default_collate(x_remain)
+    return [mpnn_feature] + x_remain_collated
 
 class DBTA:
     def __init__(self, **config):
@@ -454,6 +501,7 @@ class DBTA:
         self.model = Classifier(self.model_drug, self.model_protein, **config)
         self.config = config
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        #self.device = device
         self.result_folder = config['result_folder']
         if not os.path.exists(self.result_folder):
             os.mkdir(self.result_folder)            
@@ -477,6 +525,7 @@ class DBTA:
                 loss_fct = torch.nn.MSELoss()
                 n = torch.squeeze(score, 1)
                 loss = loss_fct(n, Variable(torch.from_numpy(np.array(label)).float()).to(self.device))
+                #loss = loss_fct(n, Variable(torch.from_numpy(np.array(label)).float()).to(device))
                 logits = torch.squeeze(score).detach().cpu().numpy()
             label_ids = label.to('cpu').numpy()
             y_label = y_label + label_ids.flatten().tolist()
@@ -503,7 +552,7 @@ class DBTA:
 
     def train(self, train, val, test = None, verbose = True):
         if len(train.label.unique()) == 2:
-            print("binary")
+            #print("binary")
             self.binary = True
             self.config['binary'] = True
 
@@ -518,6 +567,7 @@ class DBTA:
         loss_history = []
 
         self.model = self.model.to(self.device)
+        #self.model = self.model.to(device)
 
         # support multiple GPUs
         if torch.cuda.device_count() > 1:
@@ -538,12 +588,12 @@ class DBTA:
         params = {'batch_size': BATCH_SIZE,
                 'shuffle': True,
                 'num_workers': self.config['num_workers'],
-                'drop_last': False
+                'drop_last': False,
                 'collate_fn': mpnn_collate_func
                 }
 
-        training_generator = data.DataLoader(data_process_loader(train.index.values, train.Label.values, train, **self.config), **params)
-        validation_generator = data.DataLoader(data_process_loader(val.index.values, val.Label.values, val, **self.config), **params)
+        training_generator = data.DataLoader(data_process_loader(train.index.values, train.label.values, train, **self.config), **params)
+        validation_generator = data.DataLoader(data_process_loader(val.index.values, val.label.values, val, **self.config), **params)
         
         if test is not None:
             info = data_process_loader(test.index.values, test.Label.values, test, **self.config)
@@ -551,10 +601,10 @@ class DBTA:
                     'shuffle': False,
                     'num_workers': self.config['num_workers'],
                     'drop_last': False,
-                    'sampler':SequentialSampler(info)
+                    'sampler':SequentialSampler(info),
                     'collate_fn': mpnn_collate_func
                     }
-            testing_generator = data.DataLoader(data_process_loader(test.index.values, test.Label.values, test, **self.config), **params_test)
+            testing_generator = data.DataLoader(data_process_loader(test.index.values, test.label.values, test, **self.config), **params_test)
 
         # early stopping
         if self.binary:
@@ -579,10 +629,12 @@ class DBTA:
         for epo in range(train_epoch):
             for i, (v_d, v_p, label) in enumerate(training_generator):
                 v_p = v_p.float().to(self.device) 
+                #v_p = v_p.float().to(device) 
                 v_d = v_d
                
                 score = self.model(v_d, v_p)
                 label = Variable(torch.from_numpy(np.array(label)).float()).to(self.device)
+                #label = Variable(torch.from_numpy(np.array(label)).float()).to(device)
 
                 if self.binary:
                     loss_fct = torch.nn.BCELoss()      # 计算目标值和预测值之间的二进制交叉熵损失函数
@@ -708,11 +760,8 @@ class DBTA:
                 'shuffle': False,
                 'num_workers': self.config['num_workers'],
                 'drop_last': False,
-                'sampler':SequentialSampler(info)}
-
-        if (self.drug_encoding == "MPNN"):
-            params['collate_fn'] = mpnn_collate_func
-
+                'sampler':SequentialSampler(info),
+                'collate_fn': mpnn_collate_func}
 
         generator = data.DataLoader(info, **params)
 
@@ -730,6 +779,7 @@ class DBTA:
             os.makedirs(path)
 
         if self.device == 'cuda':
+        #if device == 'cuda':
             state_dict = torch.load(path)
         else:
             state_dict = torch.load(path, map_location = torch.device('cpu'))
@@ -753,13 +803,13 @@ def model_initialize(**config):
     return model
 
 def fold_10_valid(fold_datase):
-    for i in fold_datase:
-        train, tes = get_train_test(i)
-        config = generate_config(drug_encoding = drug_encoding, 
-                         target_encoding = target_encoding, 
-                         cls_hidden_dims = [1024,1024,512], 
-                         train_epoch = 5, 
-                         LR = 0.001, 
+    for i in range(len(fold_datase)):
+        print("the "+str(i)+" cross fold beginning!")
+        train, tes = get_train_test(fold_datase[i])
+        config = generate_config(cls_hidden_dims = [1024,1024,512],
+                         result_folder = "./result_" + str(i) + "/",
+                         train_epoch = 30, 
+                         LR = 0.0001, 
                          batch_size = 128,
                          hidden_dim_drug = 128,
                          mpnn_hidden_size = 128,
@@ -768,7 +818,9 @@ def fold_10_valid(fold_datase):
                          cnn_target_kernels = [4,8,12]
                         )
         model = model_initialize(**config)
+        #model = model.cuda()
         model.train(train, tes)
+        model.save_model("./result_" + str(i) + "/fold_" + str(i) + "_model")
 
 def main():
     smiles = str(sys.argv[1])
@@ -778,6 +830,7 @@ def main():
     dict_icv_drug_encoding = smiles_embed(smiles)
     dict_target_protein_encoding = protein_embed(protein)
     fold_dataset = sampling(DTI, dict_icv_drug_encoding, dict_target_protein_encoding)
+    fold_10_valid(fold_dataset)
 
 if __name__=="__main__":
     main() 
