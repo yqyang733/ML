@@ -493,6 +493,10 @@ def mpnn_collate_func(x):
     x_remain_collated = default_collate(x_remain)
     return [mpnn_feature] + x_remain_collated
 
+def save_dict(path, obj):
+    with open(os.path.join(path, 'config.pkl'), 'wb') as f:
+        pickle.dump(obj, f, pickle.HIGHEST_PROTOCOL)
+
 class DBTA:
     def __init__(self, **config):
 
