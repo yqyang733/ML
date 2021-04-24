@@ -635,7 +635,7 @@ class DBTA:
                 v_p = v_p.float().to(self.device) 
                 #v_p = v_p.float().to(device) 
                 v_d = v_d
-               
+                
                 score = self.model(v_d, v_p)
                 label = Variable(torch.from_numpy(np.array(label)).float()).to(self.device)
                 #label = Variable(torch.from_numpy(np.array(label)).float()).to(device)
