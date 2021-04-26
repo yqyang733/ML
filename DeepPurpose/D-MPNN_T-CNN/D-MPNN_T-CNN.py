@@ -300,7 +300,7 @@ class MPNN(nn.Sequential):
         super(MPNN, self).__init__()
         self.mpnn_hidden_size = mpnn_hidden_size
         self.mpnn_depth = mpnn_depth 
-        from DeepPurpose.chemutils import ATOM_FDIM, BOND_FDIM
+        #from DeepPurpose.chemutils import ATOM_FDIM, BOND_FDIM
 
         self.W_i = nn.Linear(ATOM_FDIM + BOND_FDIM, self.mpnn_hidden_size, bias=False)
         self.W_h = nn.Linear(self.mpnn_hidden_size, self.mpnn_hidden_size, bias=False)
